@@ -1,0 +1,9 @@
+services:
+  - type: worker
+    name: alboraa-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 bot.py
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false
