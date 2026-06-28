@@ -1,296 +1,360 @@
-#!/usr/bin/env python3
-"""
-ALBORAA BOT – Arbitrage Sportif
-Version VPS – 23/06/2026
-Déploiement : systemd service sur Linux (Ubuntu/Debian)
-"""
-
 import logging
-import os
+from itertools import product
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from io import BytesIO
-from datetime import datetime
-
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
+from datetime import datetime
+TELEGRAM_TOKEN = "8935700557:AAFF00ot8CoQ18gQ0XRZT1D4o0v7krQFw"
+Logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO
 )
-
-# ============================================================
-# CONFIGURATION – Remplacez par votre token
-# ============================================================
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "VOTRE_TOKEN_ICI")
-
-# (Optionnel) Limitez l'accès à vos propres Telegram user IDs
-# Laissez vide [] pour autoriser tout le monde
-ALLOWED_USERS: list[int] = []
-
-# ============================================================
-# LOGGING
-# ============================================================
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("alboraa.log"),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger(__name__)
-
-# ============================================================
-# STOCKAGE EN MÉMOIRE (sessions actives uniquement)
-# Pour une persistance entre redémarrages, utilisez SQLite.
-# ============================================================
-historique: list[dict] = []
-
-
-# ============================================================
-# MOTEUR D'ARBITRAGE
-# ============================================================
-class ArbitrageEngine:
-    """Calcule les opportunités d'arbitrage sur 2 ou 3 issues."""
+MISE_DEFAUT = 5000
+SEUIL_BENEFICE = 1.015  # 1.50%
+# Historique session par utilisateur
+historique = {}
+# ─────────────────────────────────────────────
+# MOTEUR ARBITRAGE
+# ─────────────────────────────────────────────
+class AlboraEngine:
 
     @staticmethod
-    def calculer(cotes: list[float]) -> dict:
-        if len(cotes) not in (2, 3):
-            raise ValueError("Fournissez 2 ou 3 cotes.")
-
+    def detect_arbitrage(cotes: list[float]) -> dict:
+        """Détecte un arbitrage sur 2 ou 3 cotes d'un même match."""
         s = sum(1 / c for c in cotes)
-        profit_pct = round((1 / s - 1) * 100, 3)
-        mises_pct = [round((1 / c / s) * 100, 2) for c in cotes]
-
-        labels = (
-            ["1 (Home)", "2 (Away)"]
-            if len(cotes) == 2
-            else ["1 (Home)", "X (Draw)", "2 (Away)"]
-        )
-
-        return {
-            "arbitrage": s < 1,
-            "s": round(s, 4),
-            "profit_pct": profit_pct,
-            "mises_pct": dict(zip(labels, mises_pct)),
-        }
+        if s < 1:
+            profit = round((1 / s - 1) * 100, 2)
+            stakes = {f"cote_{i+1}": round((1 / c / s) * 100, 2) for i, c in enumerate(cotes)}
+            return {"arbitrage": True, "profit": profit, "stakes": stakes, "sum": round(s, 4)}
+        return {"arbitrage": False, "sum": round(s, 4)}
 
     @staticmethod
-    def simuler_mises(result: dict, mise_totale: float) -> dict:
-        """Calcule les mises réelles en € pour une mise totale donnée."""
-        return {
-            label: round(pct / 100 * mise_totale, 2)
-            for label, pct in result["mises_pct"].items()
-        }
+    def combo_matchs(matchs: list[list[float]], mise: float) -> list[dict]:
+        """
+        Génère toutes les combinaisons entre matchs (1 cote par match).
+        Filtre : gain >= mise * 1.015
+        Trie du plus petit au plus grand.
+        """
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        resultats = []
+        seuil = mise * SEUIL_BENEFICE
+
+        # Génère toutes les combinaisons (1 cote par match)
+        for combo in product(*[range(len(m)) for m in matchs]):
+            cotes_selectionnees = [matchs[i][combo[i]] for i in range(len(matchs))]
+            noms = [f"{labels[i]}{combo[i]+1}" for i in range(len(matchs))]
+
+            cote_totale = 1
+            for c in cotes_selectionnees:
+                cote_totale *= c
+            cote_totale = round(cote_totale, 4)
+
+            gain = round(mise * cote_totale, 0)
+            benefice_net = round(gain - mise, 0)
+            benefice_pct = round((cote_totale - 1) * 100, 2)
+
+            if gain >= seuil:
+                resultats.append({
+                    "noms": "+".join(noms),
+                    "cotes": cotes_selectionnees,
+                    "cote_totale": cote_totale,
+                    "gain": int(gain),
+                    "benefice_net": int(benefice_net),
+                    "benefice_pct": benefice_pct,
+                })
+
+        resultats.sort(key=lambda x: x["cote_totale"])
+        return resultats
 
 
-# ============================================================
-# GARDE D'ACCÈS
-# ============================================================
-def acces_autorise(user_id: int) -> bool:
-    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+# ─────────────────────────────────────────────
+# COMMANDES
+# ─────────────────────────────────────────────
 
-
-# ============================================================
-# HANDLERS
-# ============================================================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not acces_autorise(update.effective_user.id):
-        return
-
-    texte = (
-        "⚡ *Alboraa – Bot d'Arbitrage Sportif*\n\n"
+    msg = (
+        "⚡ *ALBORAA BOT — Arbitrage & Combinaisons*\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
         "📌 *Commandes disponibles :*\n\n"
-        "`/arbitrage <c1> <c2> [c3]`\n"
-        "→ Analyse 2 ou 3 cotes\n\n"
-        "`/simuler <c1> <c2> [c3] <mise_totale>`\n"
-        "→ Calcule les mises réelles en €\n\n"
-        "`/bilan`\n"
-        "→ Exporte l'historique en Excel\n\n"
-        "`/effacer`\n"
-        "→ Vide l'historique de cette session\n\n"
-        "*Exemple :*\n"
-        "`/arbitrage 1.21 3.02 3.21`\n"
-        "`/simuler 1.21 3.02 3.21 1000`"
+        "🔹 `/arbitrage 1.21 3.02 3.10`\n"
+        "   → Détecte un arbitrage sur un match\n\n"
+        "🔹 `/combo 1.21 3.02 3.10 | 1.22 3.01 3.11`\n"
+        "   → Combinaisons multi-matchs (2 à 10)\n"
+        "   → Ajoutez la mise : `/combo ... 10000`\n\n"
+        "🔹 `/simuler 1.85 10000`\n"
+        "   → Simule un gain pour une cote et mise\n\n"
+        "🔹 `/bilan` → Historique de la session\n"
+        "🔹 `/effacer` → Efface l'historique\n"
+        "🔹 `/export` → Exporte l'historique Excel\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "💰 Devise : *Franc CFA (FCFA)*\n"
+        "📊 Mise défaut : *5 000 FCFA*\n"
+        "📈 Seuil bénéfice : *+1.50% minimum*"
     )
-    await update.message.reply_text(texte, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="Markdown")
 
 
 async def arbitrage(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not acces_autorise(update.effective_user.id):
-        return
-
     args = context.args
-    if len(args) not in (2, 3):
+    if len(args) < 2 or len(args) > 3:
         await update.message.reply_text(
-            "❗ Format : `/arbitrage cote1 cote2` ou `/arbitrage cote1 cote2 cote3`",
-            parse_mode="Markdown",
+            "⚠ Format : `/arbitrage 1.21 3.02 3.10`\n"
+            "Ou 2 cotes : `/arbitrage 1.45 2.10`",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        cotes = list(map(float, args))
+        result = AlboraEngine.detect_arbitrage(cotes)
+
+        if result["arbitrage"]:
+            stakes_str = "\n".join(
+                [f"  • Cote {k[-1]} ({cotes[int(k[-1])-1]}) → {v}%" for k, v in result["stakes"].items()]
+            )
+            msg = (
+                f"✅ *ARBITRAGE DÉTECTÉ !*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📈 Profit garanti : *{result['profit']}%*\n"
+                f"📊 Somme inverses : {result['sum']}\n\n"
+                f"💰 *Répartition des mises (sur 100%) :*\n"
+                f"{stakes_str}"
+            )
+            _save_historique(update.effective_user.id, "arbitrage", cotes, result)
+        else:
+            msg = (
+                f"❌ *Pas d'arbitrage*\n"
+                f"Somme des inverses : {result['sum']} (doit être < 1.00)"
+            )
+
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except ValueError:
+        await update.message.reply_text("⚠ Cotes invalides. Exemple : `/arbitrage 1.21 3.02 3.10`", parse_mode="Markdown")
+
+
+async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Format : /combo 1.21 3.02 3.10 | 1.22 3.01 3.11 | 1.45 2.80 3.05 [mise]
+    Séparateur : | entre les matchs
+    Dernier argument numérique sans | = mise en FCFA
+    """
+    if not context.args:
+        await update.message.reply_text(
+            "⚠ Format :\n`/combo 1.21 3.02 3.10 | 1.22 3.01 3.11`\n\n"
+            "Avec mise : `/combo 1.21 3.02 3.10 | 1.22 3.01 3.11 10000`\n\n"
+            "Jusqu'à 10 matchs séparés par `|`",
+            parse_mode="Markdown"
         )
         return
 
     try:
-        cotes = list(map(float, args))
-        result = ArbitrageEngine.calculer(cotes)
-    except ValueError as e:
-        await update.message.reply_text(f"❗ Erreur : {e}")
-        return
-    except Exception:
-        await update.message.reply_text("❗ Utilisez des nombres valides (ex: 1.10 3.02 3.21)")
-        return
+        # Reconstruire la ligne complète
+        ligne = " ".join(context.args)
 
-    # Enregistrement dans l'historique
-    historique.append(
-        {
-            "date": datetime.now().strftime("%d/%m/%Y %H:%M"),
-            "cotes": cotes,
-            "s": result["s"],
-            "arbitrage": result["arbitrage"],
-            "profit_pct": result["profit_pct"],
-        }
-    )
+        # Détecter si la mise est à la fin (dernier token sans |)
+        tokens = ligne.split()
+        mise = MISE_DEFAUT
+        try:
+            derniere = float(tokens[-1])
+            # Si dernier token est un nombre et n'est pas précédé d'un |
+            if "|" not in tokens[-1] and derniere > 100:
+                mise = derniere
+                ligne = " ".join(tokens[:-1])
+        except ValueError:
+            pass
 
-    if result["arbitrage"]:
-        lignes_mises = "\n".join(
-            f"  • {label} : {pct} %" for label, pct in result["mises_pct"].items()
-        )
-        msg = (
-            f"🔔 *ARBITRAGE DÉTECTÉ !*\n\n"
-            f"📈 Profit garanti : `{result['profit_pct']} %`\n"
-            f"📊 Somme S : `{result['s']}`\n\n"
-            f"💰 *Répartition des mises :*\n{lignes_mises}\n\n"
-            f"_Utilisez `/simuler` pour calculer les montants réels._"
-        )
-    else:
-        msg = (
-            f"❌ *Pas d'arbitrage*\n\n"
-            f"📊 Somme S : `{result['s']}` (doit être < 1.000 pour arbitrer)\n"
-            f"📉 Marge bookmaker : `{abs(result['profit_pct']):.2f} %`"
-        )
+        # Séparer les matchs par |
+        matchs_raw = ligne.split("|")
+        matchs = []
+        for m in matchs_raw:
+            cotes = [float(x) for x in m.strip().split() if x.strip()]
+            if cotes:
+                matchs.append(cotes)
 
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        if len(matchs) < 2:
+            await update.message.reply_text("⚠ Minimum 2 matchs séparés par `|`", parse_mode="Markdown")
+            return
+        if len(matchs) > 10:
+            await update.message.reply_text("⚠ Maximum 10 matchs.", parse_mode="Markdown")
+            return
+
+        # Calcul
+        resultats = AlboraEngine.combo_matchs(matchs, mise)
+
+        # Construire le message
+        nb_combos_total = 1
+        for m in matchs:
+            nb_combos_total *= len(m)
+
+        nb_filtrees = nb_combos_total - len(resultats)
+        seuil_fcfa = int(mise * SEUIL_BENEFICE)
+
+        if not resultats:
+            msg = (
+                f"❌ *Aucune combinaison rentable*\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 {nb_combos_total} combinaisons analysées\n"
+                f"💰 Mise : {int(mise):,} FCFA\n"
+                f"📉 Seuil minimum : {seuil_fcfa:,} FCFA (+1.50%)\n\n"
+                f"Toutes les combinaisons sont sous le seuil de rentabilité."
+            )
+        else:
+            lignes = []
+            for i, r in enumerate(resultats, 1):
+                cotes_str = " × ".join(str(c) for c in r["cotes"])
+                lignes.append(
+                    f"{i}. *{r['noms']}* = {cotes_str} = *{r['cote_totale']}*\n"
+                    f"   💵 {r['gain']:,} FCFA  (+{r['benefice_pct']}% | +{r['benefice_net']:,} FCFA)"
+                )
+
+            bloc = "\n\n".join(lignes)
+            msg = (
+                f"⚽ *ALBORAA — Combinaisons {len(matchs)} matchs*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Mise : *{int(mise):,} FCFA*  |  Seuil : +1.50%\n"
+                f"📊 {len(resultats)} rentables / {nb_combos_total} total  |  {nb_filtrees} éliminées\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"{bloc}\n\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🏆 *Meilleure :* {resultats[-1]['noms']} → {resultats[-1]['gain']:,} FCFA"
+            )
+
+        _save_historique(update.effective_user.id, "combo", matchs, resultats)
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠ Erreur de format.\nExemple : `/combo 1.21 3.02 3.10 | 1.22 3.01 3.11`",
+            parse_mode="Markdown"
+        )
 
 
 async def simuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not acces_autorise(update.effective_user.id):
-        return
-
     args = context.args
-    if len(args) not in (3, 4):
-        await update.message.reply_text(
-            "❗ Format : `/simuler c1 c2 mise` ou `/simuler c1 c2 c3 mise`",
-            parse_mode="Markdown",
-        )
+    if len(args) != 2:
+        await update.message.reply_text("Format : `/simuler 1.85 10000`", parse_mode="Markdown")
         return
-
     try:
-        *cotes_str, mise_str = args
-        cotes = list(map(float, cotes_str))
-        mise_totale = float(mise_str)
-        result = ArbitrageEngine.calculer(cotes)
-    except Exception:
-        await update.message.reply_text("❗ Vérifiez vos valeurs (nombres décimaux).")
-        return
+        cote = float(args[0])
+        mise = float(args[1])
+        gain = round(mise * cote, 0)
+        benefice = round(gain - mise, 0)
+        pct = round((cote - 1) * 100, 2)
 
-    if not result["arbitrage"]:
-        await update.message.reply_text(
-            f"❌ Pas d'arbitrage possible (S = {result['s']}). Simulation annulée."
+        msg = (
+            f"📊 *SIMULATION*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🎯 Cote : *{cote}*\n"
+            f"💰 Mise : *{int(mise):,} FCFA*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💵 Gain total : *{int(gain):,} FCFA*\n"
+            f"📈 Bénéfice net : *+{int(benefice):,} FCFA* (+{pct}%)"
         )
-        return
-
-    mises_reelles = ArbitrageEngine.simuler_mises(result, mise_totale)
-    gain_net = round(mise_totale * result["profit_pct"] / 100, 2)
-
-    lignes = "\n".join(
-        f"  • {label} : `{montant} €`" for label, montant in mises_reelles.items()
-    )
-    msg = (
-        f"🧮 *Simulation – Mise totale : {mise_totale} €*\n\n"
-        f"📈 Profit : `{result['profit_pct']} %` → `+{gain_net} €`\n\n"
-        f"💰 *Mises à placer :*\n{lignes}"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+        _save_historique(update.effective_user.id, "simuler", [cote, mise], {"gain": gain, "benefice": benefice})
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("⚠ Erreur. Exemple : `/simuler 1.85 10000`", parse_mode="Markdown")
 
 
 async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not acces_autorise(update.effective_user.id):
+    uid = update.effective_user.id
+    if uid not in historique or not historique[uid]:
+        await update.message.reply_text("📭 Aucun historique pour cette session.")
         return
 
-    if not historique:
-        await update.message.reply_text("📭 Aucun calcul enregistré dans cette session.")
-        return
+    lignes = [f"📋 *BILAN SESSION — {len(historique[uid])} opération(s)*\n━━━━━━━━━━━━━━━"]
+    for i, h in enumerate(historique[uid], 1):
+        lignes.append(f"{i}. [{h['type'].upper()}] {h['resume']} — {h['heure']}")
 
-    # Création du fichier Excel
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Bilan Alboraa"
-
-    # En-têtes
-    entetes = ["Date", "Cotes", "Somme S", "Arbitrage ?", "Profit (%)"]
-    for col, titre in enumerate(entetes, 1):
-        cell = ws.cell(row=1, column=col, value=titre)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="1F4E79")
-        cell.alignment = Alignment(horizontal="center")
-
-    # Données
-    for i, h in enumerate(historique, 2):
-        cotes_str = " | ".join(str(c) for c in h["cotes"])
-        ws.cell(row=i, column=1, value=h["date"])
-        ws.cell(row=i, column=2, value=cotes_str)
-        ws.cell(row=i, column=3, value=h["s"])
-        ws.cell(row=i, column=4, value="✅ OUI" if h["arbitrage"] else "❌ NON")
-        profit_cell = ws.cell(row=i, column=5, value=h["profit_pct"])
-        if h["arbitrage"]:
-            profit_cell.font = Font(color="006400", bold=True)
-
-    # Ajustement largeurs
-    ws.column_dimensions["A"].width = 18
-    ws.column_dimensions["B"].width = 22
-    ws.column_dimensions["C"].width = 12
-    ws.column_dimensions["D"].width = 14
-    ws.column_dimensions["E"].width = 14
-
-    buffer = BytesIO()
-    wb.save(buffer)
-    buffer.seek(0)
-
-    await update.message.reply_document(
-        document=buffer,
-        filename=f"bilan_alboraa_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
-        caption=f"📊 *Bilan Alboraa* – {len(historique)} calcul(s) exporté(s).",
-        parse_mode="Markdown",
-    )
+    await update.message.reply_text("\n".join(lignes), parse_mode="Markdown")
 
 
 async def effacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not acces_autorise(update.effective_user.id):
+    uid = update.effective_user.id
+    historique[uid] = []
+    await update.message.reply_text("🗑 Historique effacé.")
+
+
+async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if uid not in historique or not historique[uid]:
+        await update.message.reply_text("📭 Aucune donnée à exporter.")
         return
 
-    n = len(historique)
-    historique.clear()
-    await update.message.reply_text(f"🗑️ Historique effacé ({n} entrée(s) supprimée(s)).")
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Alboraa Session"
+
+    # En-têtes
+    headers = ["#", "Type", "Résumé", "Heure"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="1a1a2e")
+        cell.alignment = Alignment(horizontal="center")
+
+    for i, h in enumerate(historique[uid], 2):
+        ws.cell(row=i, column=1, value=i - 1)
+        ws.cell(row=i, column=2, value=h["type"].upper())
+        ws.cell(row=i, column=3, value=h["resume"])
+        ws.cell(row=i, column=4, value=h["heure"])
+
+    ws.column_dimensions["C"].width = 60
+
+    buf = BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    await update.message.reply_document(
+        document=buf,
+        filename=f"alboraa_session_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+        caption="📊 Export session Alboraa"
+    )
 
 
-# ============================================================
-# POINT D'ENTRÉE
-# ============================================================
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
+def _save_historique(uid: int, type_op: str, data, result):
+    if uid not in historique:
+        historique[uid] = []
+
+    heure = datetime.now().strftime("%H:%M:%S")
+
+    if type_op == "arbitrage":
+        arb = result.get("arbitrage", False)
+        resume = f"Cotes {data} → {'ARB +' + str(result.get('profit','')) + '%' if arb else 'Pas d arbitrage'}"
+    elif type_op == "combo":
+        nb = len(result)
+        resume = f"{len(data)} matchs → {nb} combo(s) rentable(s)"
+    elif type_op == "simuler":
+        resume = f"Cote {data[0]} / Mise {int(data[1]):,} FCFA → Gain {int(result['gain']):,} FCFA"
+    else:
+        resume = str(data)
+
+    historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
+
+
+# ─────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────
+
 def main():
-    if TELEGRAM_TOKEN == "VOTRE_TOKEN_ICI":
-        logger.error("❌ Veuillez définir TELEGRAM_TOKEN dans les variables d'environnement.")
-        return
-
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("arbitrage", arbitrage))
+    app.add_handler(CommandHandler("combo", combo))
     app.add_handler(CommandHandler("simuler", simuler))
     app.add_handler(CommandHandler("bilan", bilan))
     app.add_handler(CommandHandler("effacer", effacer))
+    app.add_handler(CommandHandler("export", export))
 
-    logger.info("🤖 Bot Alboraa démarré (mode polling).")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 Bot Alboraa démarré — En attente de messages Telegram...")
+    app.run_polling()
 
 
 if __name__ == "__main__":
