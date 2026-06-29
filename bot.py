@@ -7,14 +7,11 @@ from io import BytesIO
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
-
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-
 MISE_DEFAUT = 5000
 SEUIL_BENEFICE = 1.015
 historique = {}
@@ -52,8 +49,6 @@ class AlboraEngine:
                 })
         resultats.sort(key=lambda x: x["cote_totale"])
         return resultats
-
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "ALBORAA BOT - Arbitrage et Combinaisons\n"
@@ -69,7 +64,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Seuil benefice: +1.50% minimum"
     )
     await update.message.reply_text(msg)
-
 
 async def arbitrage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
@@ -88,7 +82,6 @@ async def arbitrage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg)
     except ValueError:
         await update.message.reply_text("Cotes invalides. Exemple: /arbitrage 1.21 3.02 3.10")
-
 
 async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -133,7 +126,6 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception:
         await update.message.reply_text("Erreur de format. Exemple: /combo 1.21 3.02 | 1.22 3.01")
 
-
 async def simuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) != 2:
@@ -151,7 +143,6 @@ async def simuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except ValueError:
         await update.message.reply_text("Erreur. Exemple: /simuler 1.85 10000")
 
-
 async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in historique or not historique[uid]:
@@ -161,13 +152,9 @@ async def bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for i, h in enumerate(historique[uid], 1):
         lignes.append(f"{i}. [{h['type'].upper()}] {h['resume']} - {h['heure']}")
     await update.message.reply_text("\n".join(lignes))
-
-
 async def effacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     historique[update.effective_user.id] = []
     await update.message.reply_text("Historique efface.")
-
-
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     if uid not in historique or not historique[uid]:
@@ -196,8 +183,6 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename=f"alboraa_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
         caption="Export session Alboraa"
     )
-
-
 def _save_historique(uid, type_op, data, result):
     if uid not in historique:
         historique[uid] = []
@@ -212,8 +197,6 @@ def _save_historique(uid, type_op, data, result):
     else:
         resume = str(data)
     historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
-
-
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
@@ -225,7 +208,5 @@ def main():
     app.add_handler(CommandHandler("export", export))
     print("Bot Alboraa demarre")
     app.run_polling()
-
-
 if __name__ == "__main__":
     main()
