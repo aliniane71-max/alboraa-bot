@@ -22,7 +22,6 @@ SEUIL_BENEFICE_FCFA = 2000   # +2000 FCFA benefice net minimum pour ✅
 SEUIL_ALERTE = 0.10
 INTERVALLE_SCAN = 1800
 ODDS_API_URL = "https://api.the-odds-api.com/v4"
-
 historique = {}
 bankroll_data = {}
 objectif_data = {}
@@ -31,7 +30,6 @@ alertes_envoyees = set()
 # ─────────────────────────────────────────────
 # MOTEUR DE CALCUL
 # ─────────────────────────────────────────────
-
 class AlboraEngine:
     @staticmethod
     def detect_arbitrage(cotes):
@@ -109,7 +107,6 @@ class AlboraEngine:
                 "value": c > cote_juste,
             })
         return values, marge
-
     @staticmethod
     def evaluer_risque(cotes_combo):
         cote_totale = 1.0
@@ -135,7 +132,6 @@ class AlboraEngine:
 # ODDS API
 # ─────────────────────────────────────────────
 class OddsEngine:
-
     @staticmethod
     def get_sports():
         if not ODDS_API_KEY:
@@ -216,7 +212,6 @@ class OddsEngine:
 # ─────────────────────────────────────────────
 # SCANNER AUTOMATIQUE
 # ─────────────────────────────────────────────
-
 def scanner_loop(bot_token: str):
     bot = Bot(token=bot_token)
     logging.info("Scanner automatique demarre.")
@@ -720,11 +715,9 @@ def _save_historique(uid, type_op, data, result):
     else:
         resume = str(data)
     historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
-
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
-
 def main():
     scanner_thread = threading.Thread(target=scanner_loop, args=(TELEGRAM_TOKEN,), daemon=True)
     scanner_thread.start()
