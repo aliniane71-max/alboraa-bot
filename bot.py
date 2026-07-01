@@ -1,4 +1,3 @@
-import logging
 import os
 import re
 import threading
@@ -17,21 +16,23 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-MISE_DEFAUT = 100000
+MISE_DEFAUT = 50000
 TAXE = 0.10
-SEUIL_ALERTE = 0.5        # +10% gain net
-INTERVALLE_SCAN = 1800     # 30 minutes en secondes
+SEUIL_BENEFICE_FCFA = 2000   # +2000 FCFA benefice net minimum pour ✅
+SEUIL_ALERTE = 0.10
+INTERVALLE_SCAN = 1800
 ODDS_API_URL = "https://api.the-odds-api.com/v4"
+
 historique = {}
 bankroll_data = {}
 objectif_data = {}
-abonnes_alertes = set()    # uids ayant activé les alertes
-alertes_envoyees = set()   # évite les doublons d'alertes
+abonnes_alertes = set()
+alertes_envoyees = set()
 # ─────────────────────────────────────────────
 # MOTEUR DE CALCUL
 # ─────────────────────────────────────────────
-class AlboraEngine:
 
+class AlboraEngine:
     @staticmethod
     def detect_arbitrage(cotes):
         s = sum(1 / c for c in cotes)
@@ -70,8 +71,10 @@ class AlboraEngine:
             gain_brut = round(mise_par_combo * cote_totale, 0)
             taxe = round(gain_brut * TAXE, 0)
             gain_net = round(gain_brut - taxe, 0)
+            benefice_net = round(gain_net - mise_totale, 0)
             benefice_pct = round((gain_net / mise_totale - 1) * 100, 2)
             prob = round((1 / cote_totale) * 100, 2)
+            rentable = benefice_net >= SEUIL_BENEFICE_FCFA
             resultats.append({
                 "noms_combo": " + ".join(noms_combo),
                 "cote_totale": cote_totale,
@@ -79,9 +82,10 @@ class AlboraEngine:
                 "gain_brut": int(gain_brut),
                 "taxe": int(taxe),
                 "gain_net": int(gain_net),
+                "benefice_net": int(benefice_net),
                 "benefice_pct": benefice_pct,
                 "prob": prob,
-                "rentable": benefice_pct >= SEUIL_ALERTE * 100,
+                "rentable": rentable,
             })
         resultats.sort(key=lambda x: x["cote_totale"])
         return resultats, nb_total, int(mise_par_combo)
@@ -105,6 +109,7 @@ class AlboraEngine:
                 "value": c > cote_juste,
             })
         return values, marge
+
     @staticmethod
     def evaluer_risque(cotes_combo):
         cote_totale = 1.0
@@ -127,53 +132,38 @@ class AlboraEngine:
             "nb_matchs": len(cotes_combo),
         }
 # ─────────────────────────────────────────────
-# MOTEUR ODDS API
+# ODDS API
 # ─────────────────────────────────────────────
 class OddsEngine:
+
     @staticmethod
     def get_sports():
         if not ODDS_API_KEY:
             return []
         try:
-            r = requests.get(
-                f"{ODDS_API_URL}/sports",
-                params={"apiKey": ODDS_API_KEY},
-                timeout=10
-            )
+            r = requests.get(f"{ODDS_API_URL}/sports", params={"apiKey": ODDS_API_KEY}, timeout=10)
             if r.status_code == 200:
                 return r.json()
         except Exception as e:
             logging.error(f"get_sports error: {e}")
         return []
     @staticmethod
-    def get_odds(sport_key, regions="eu", markets="h2h"):
+    def get_odds(sport_key):
         if not ODDS_API_KEY:
             return []
         try:
             r = requests.get(
                 f"{ODDS_API_URL}/sports/{sport_key}/odds",
-                params={
-                    "apiKey": ODDS_API_KEY,
-                    "regions": regions,
-                    "markets": markets,
-                    "oddsFormat": "decimal",
-                },
+                params={"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h", "oddsFormat": "decimal"},
                 timeout=15
             )
             if r.status_code == 200:
                 return r.json()
-            else:
-                logging.warning(f"Odds API {r.status_code}: {r.text[:200]}")
         except Exception as e:
             logging.error(f"get_odds error: {e}")
         return []
     @staticmethod
     def analyser_matchs(events):
-        """
-        Pour chaque match, récupère les meilleures cotes
-        disponibles parmi tous les bookmakers et détecte
-        les arbitrages et combos rentables.
-        """
         opportunites = []
         for event in events:
             home = event.get("home_team", "?")
@@ -182,9 +172,7 @@ class OddsEngine:
             bookmakers = event.get("bookmakers", [])
             if not bookmakers:
                 continue
-            # Meilleures cotes parmi tous les bookmakers
-            best = {"home": 0, "draw": 0, "away": 0,
-                    "bk_home": "", "bk_draw": "", "bk_away": ""}
+            best = {"home": 0, "draw": 0, "away": 0, "bk_home": "", "bk_draw": "", "bk_away": ""}
             for bk in bookmakers:
                 bk_name = bk.get("title", "?")
                 for market in bk.get("markets", []):
@@ -202,19 +190,15 @@ class OddsEngine:
                         elif name == "Draw" and price > best["draw"]:
                             best["draw"] = price
                             best["bk_draw"] = bk_name
-            cotes = [best["home"], best["draw"], best["away"]]
-            cotes = [c for c in cotes if c > 1]
+            cotes = [c for c in [best["home"], best["draw"], best["away"]] if c > 1]
             if len(cotes) < 2:
                 continue
-            # Détection arbitrage
             arb = AlboraEngine.detect_arbitrage(cotes)
-            ##Analyse value
             values, marge = AlboraEngine.detect_value(cotes)
-            value_cotes = [v for v in values if v["value"]]
-            # Simulation combo rentable
             gain_brut = round(MISE_DEFAUT * max(cotes), 0)
             taxe = round(gain_brut * TAXE, 0)
             gain_net = round(gain_brut - taxe, 0)
+            benefice_net = round(gain_net - MISE_DEFAUT, 0)
             benefice_pct = round((gain_net / MISE_DEFAUT - 1) * 100, 2)
             opportunites.append({
                 "match": f"{home} vs {away}",
@@ -222,92 +206,63 @@ class OddsEngine:
                 "cotes": cotes,
                 "best": best,
                 "arbitrage": arb,
-                "value_cotes": value_cotes,
+                "value_cotes": [v for v in values if v["value"]],
                 "marge": marge,
-                "gain_net_max": gain_net,
+                "gain_net": gain_net,
+                "benefice_net": benefice_net,
                 "benefice_pct": benefice_pct,
             })
         return opportunites
 # ─────────────────────────────────────────────
-# SCANNER AUTOMATIQUE (thread background)
+# SCANNER AUTOMATIQUE
 # ─────────────────────────────────────────────
+
 def scanner_loop(bot_token: str):
-    """
-    Tourne en arrière-plan toutes les 30 minutes.
-    Récupère les cotes, détecte les opportunités
-    et envoie des alertes Telegram aux abonnés.
-    """
     bot = Bot(token=bot_token)
-    logging.info("Scanner automatique démarré.")
+    logging.info("Scanner automatique demarre.")
     while True:
         try:
-            if not abonnes_alertes:
-                time.sleep(INTERVALLE_SCAN)
-                continue
-            if not ODDS_API_KEY:
-                logging.warning("ODDS_API_KEY manquante — scanner inactif.")
-                time.sleep(INTERVALLE_SCAN)
-                continue
-            logging.info("Scan en cours...")
-            sports = OddsEngine.get_sports()
-            alertes_session = []
-            for sport in sports:
-                sport_key = sport.get("key", "")
-                sport_title = sport.get("title", sport_key)
-                if not sport.get("active"):
-                    continue
-                events = OddsEngine.get_odds(sport_key)
-                if not events:
-                    continue
-                opportunites = OddsEngine.analyser_matchs(events)
-                for opp in opportunites:
-                    match_id = f"{opp['match']}_{opp['heure']}"
-                    # Alerte arbitrage
-                    if opp["arbitrage"]["arbitrage"] and match_id + "_arb" not in alertes_envoyees:
-                        alertes_envoyees.add(match_id + "_arb")
-                        alertes_session.append({
-                            "type": "ARBITRAGE",
-                            "sport": sport_title,
-                            "opp": opp,
-                        })
-                    # Alerte value >= seuil
-                    elif opp["benefice_pct"] >= SEUIL_ALERTE * 100 and match_id + "_val" not in alertes_envoyees:
-                        alertes_envoyees.add(match_id + "_val")
-                        alertes_session.append({
-                            "type": "VALUE",
-                            "sport": sport_title,
-                            "opp": opp,
-                        })
-                time.sleep(0.5)  # respecter les limites API
-            # Envoyer les alertes aux abonnés
-            for alerte in alertes_session:
-                msg = _formater_alerte(alerte)
-                for uid in list(abonnes_alertes):
-                    try:
-                        import asyncio
-                        asyncio.run(bot.send_message(chat_id=uid, text=msg))
-                    except Exception as e:
-                        logging.error(f"Envoi alerte uid {uid}: {e}")
-            logging.info(f"Scan terminé. {len(alertes_session)} alerte(s) envoyée(s).")
+            if abonnes_alertes and ODDS_API_KEY:
+                logging.info("Scan en cours...")
+                sports = OddsEngine.get_sports()
+                alertes_session = []
+                for sport in sports:
+                    if not sport.get("active"):
+                        continue
+                    events = OddsEngine.get_odds(sport.get("key", ""))
+                    if not events:
+                        continue
+                    for opp in OddsEngine.analyser_matchs(events):
+                        match_id = f"{opp['match']}_{opp['heure']}"
+                        if opp["arbitrage"]["arbitrage"] and match_id + "_arb" not in alertes_envoyees:
+                            alertes_envoyees.add(match_id + "_arb")
+                            alertes_session.append({"type": "ARBITRAGE", "sport": sport.get("title", ""), "opp": opp})
+                        elif opp["benefice_net"] >= SEUIL_BENEFICE_FCFA and match_id + "_val" not in alertes_envoyees:
+                            alertes_envoyees.add(match_id + "_val")
+                            alertes_session.append({"type": "VALUE", "sport": sport.get("title", ""), "opp": opp})
+                    time.sleep(0.5)
+                for alerte in alertes_session:
+                    msg = _formater_alerte(alerte)
+                    for uid in list(abonnes_alertes):
+                        try:
+                            import asyncio
+                            asyncio.run(bot.send_message(chat_id=uid, text=msg))
+                        except Exception as e:
+                            logging.error(f"Envoi alerte: {e}")
+                logging.info(f"Scan termine. {len(alertes_session)} alerte(s).")
         except Exception as e:
             logging.error(f"Scanner error: {e}")
         time.sleep(INTERVALLE_SCAN)
 def _formater_alerte(alerte):
     opp = alerte["opp"]
-    t = alerte["type"]
-    sport = alerte["sport"]
     best = opp["best"]
-
-    if t == "ARBITRAGE":
+    sport = alerte["sport"]
+    if alerte["type"] == "ARBITRAGE":
         arb = opp["arbitrage"]
-        msg = (
-            f"ARBITRAGE DETECTE\n"
-            f"{'='*30}\n"
-            f"Sport: {sport}\n"
-            f"Match: {opp['match']}\n"
-            f"Heure: {opp['heure']}\n\n"
-            f"Profit garanti: +{arb['profit']}%\n"
-            f"Somme inverses: {arb['sum']}\n\n"
+        return (
+            f"ARBITRAGE DETECTE\n{'='*30}\n"
+            f"Sport: {sport}\nMatch: {opp['match']}\nHeure: {opp['heure']}\n\n"
+            f"Profit garanti: +{arb['profit']}%\nSomme: {arb['sum']}\n\n"
             f"Meilleures cotes:\n"
             f"1 ({best['bk_home']}): {best['home']}\n"
             f"N ({best['bk_draw']}): {best['draw']}\n"
@@ -315,28 +270,21 @@ def _formater_alerte(alerte):
             f"Misez maintenant sur 1xBet."
         )
     else:
-        gain_brut = round(MISE_DEFAUT * max(opp["cotes"]), 0)
-        taxe = round(gain_brut * TAXE, 0)
-        gain_net = round(gain_brut - taxe, 0)
         signe = "+" if opp["benefice_pct"] >= 0 else ""
-        msg = (
-            f"ALERTE OPPORTUNITE\n"
-            f"{'='*30}\n"
-            f"Sport: {sport}\n"
-            f"Match: {opp['match']}\n"
-            f"Heure: {opp['heure']}\n\n"
+        return (
+            f"ALERTE OPPORTUNITE\n{'='*30}\n"
+            f"Sport: {sport}\nMatch: {opp['match']}\nHeure: {opp['heure']}\n\n"
             f"Meilleures cotes:\n"
             f"1 ({best['bk_home']}): {best['home']}\n"
             f"N ({best['bk_draw']}): {best['draw']}\n"
             f"2 ({best['bk_away']}): {best['away']}\n\n"
-            f"Marge bookmaker: {opp['marge']}%\n"
             f"Simulation {MISE_DEFAUT:,} FCFA:\n"
-            f"Gain brut: {int(gain_brut):,} FCFA\n"
-            f"Taxe (10%): -{int(taxe):,} FCFA\n"
-            f"Gain net: {int(gain_net):,} FCFA ({signe}{opp['benefice_pct']}%)\n\n"
+            f"Gain brut: {int(opp['gain_net'] / 0.9):,} FCFA\n"
+            f"Taxe (10%): -{int(opp['gain_net'] / 0.9 * 0.1):,} FCFA\n"
+            f"Gain net: {int(opp['gain_net']):,} FCFA ({signe}{opp['benefice_pct']}%)\n"
+            f"Benefice net: +{int(opp['benefice_net']):,} FCFA\n\n"
             f"Misez maintenant sur 1xBet."
         )
-    return msg
 # ─────────────────────────────────────────────
 # COMMANDES TELEGRAM
 # ─────────────────────────────────────────────
@@ -351,10 +299,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/risque 1.30 2.21 | 1.45 3.10\n"
         "/simuler 1.85 10000\n\n"
         "ALERTES AUTOMATIQUES\n"
-        "/alertes_on — Activer les alertes automatiques\n"
-        "/alertes_off — Désactiver les alertes\n"
-        "/scan — Lancer un scan manuel maintenant\n"
-        "/sports — Voir les sports surveillés\n\n"
+        "/alertes_on — Activer les alertes\n"
+        "/alertes_off — Desactiver les alertes\n"
+        "/scan — Scan manuel immediat\n"
+        "/sports — Sports surveilles\n\n"
         "GESTION\n"
         "/bankroll 500000\n"
         "/bankroll_pari 5000 15000\n"
@@ -367,7 +315,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Devise: Franc CFA\n"
         f"Mise defaut: {MISE_DEFAUT:,} FCFA\n"
         f"Taxe Mali: {int(TAXE*100)}%\n"
-        f"Seuil alerte: +{int(SEUIL_ALERTE*100)}% gain net\n"
+        f"Seuil rentabilite: +{SEUIL_BENEFICE_FCFA:,} FCFA benefice net\n"
         f"Scan: toutes les 30 minutes"
     )
     await update.message.reply_text(msg)
@@ -377,73 +325,64 @@ async def alertes_on(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "ODDS_API_KEY manquante.\n"
             "Ajoutez-la dans Railway > Variables > ODDS_API_KEY\n"
-            "Clé gratuite sur : the-odds-api.com"
+            "Cle gratuite sur : the-odds-api.com"
         )
         return
     abonnes_alertes.add(uid)
     await update.message.reply_text(
-        f"Alertes activées.\n"
+        f"Alertes activees.\n"
         f"Scan toutes les 30 minutes.\n"
-        f"Seuil : +{int(SEUIL_ALERTE*100)}% gain net apres taxe.\n"
+        f"Seuil : +{SEUIL_BENEFICE_FCFA:,} FCFA benefice net minimum.\n"
         f"Utilisez /alertes_off pour desactiver."
     )
 async def alertes_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    abonnes_alertes.discard(uid)
-    await update.message.reply_text("Alertes désactivées.")
+    abonnes_alertes.discard(update.effective_user.id)
+    await update.message.reply_text("Alertes desactivees.")
 async def scan_manuel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
     if not ODDS_API_KEY:
-        await update.message.reply_text(
-            "ODDS_API_KEY manquante.\n"
-            "Clé gratuite sur : the-odds-api.com"
-        )
+        await update.message.reply_text("ODDS_API_KEY manquante. Cle gratuite sur : the-odds-api.com")
         return
-    await update.message.reply_text("Scan en cours... patientez 30 secondes.")
+    await update.message.reply_text("Scan en cours... patientez.")
     try:
         sports = OddsEngine.get_sports()
         total_alertes = []
-
-        for sport in sports[:10]:  # limiter pour le scan manuel
+        for sport in sports[:10]:
             if not sport.get("active"):
                 continue
-            sport_key = sport.get("key", "")
-            sport_title = sport.get("title", sport_key)
-            events = OddsEngine.get_odds(sport_key)
+            events = OddsEngine.get_odds(sport.get("key", ""))
             if not events:
                 continue
-            opportunites = OddsEngine.analyser_matchs(events)
-            for opp in opportunites:
-                if opp["arbitrage"]["arbitrage"] or opp["benefice_pct"] >= SEUIL_ALERTE * 100:
-                    total_alertes.append({"type": "ARBITRAGE" if opp["arbitrage"]["arbitrage"] else "VALUE", "sport": sport_title, "opp": opp})
+            for opp in OddsEngine.analyser_matchs(events):
+                if opp["arbitrage"]["arbitrage"] or opp["benefice_net"] >= SEUIL_BENEFICE_FCFA:
+                    total_alertes.append({
+                        "type": "ARBITRAGE" if opp["arbitrage"]["arbitrage"] else "VALUE",
+                        "sport": sport.get("title", ""),
+                        "opp": opp
+                    })
             time.sleep(0.3)
         if not total_alertes:
-            await update.message.reply_text(
-                f"Scan terminé. Aucune opportunité > +{int(SEUIL_ALERTE*100)}% détectée.\n"
-                f"Marchés analysés : {len(sports)} sports."
-            )
+            await update.message.reply_text(f"Scan termine. Aucune opportunite detectee.")
         else:
-            await update.message.reply_text(f"{len(total_alertes)} opportunité(s) trouvée(s) :")
-            for alerte in total_alertes[:5]:  # max 5 résultats
-                msg = _formater_alerte(alerte)
-                await update.message.reply_text(msg)
+            await update.message.reply_text(f"{len(total_alertes)} opportunite(s) trouvee(s):")
+            for alerte in total_alertes[:5]:
+                await update.message.reply_text(_formater_alerte(alerte))
     except Exception as e:
-        await update.message.reply_text(f"Erreur lors du scan : {str(e)[:200]}")
-async def sports(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(f"Erreur scan: {str(e)[:200]}")
+async def sports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ODDS_API_KEY:
-        await update.message.reply_text("ODDS_API_KEY manquante. Clé gratuite sur : the-odds-api.com")
+        await update.message.reply_text("ODDS_API_KEY manquante. Cle gratuite sur : the-odds-api.com")
         return
     try:
         sport_list = OddsEngine.get_sports()
         actifs = [s for s in sport_list if s.get("active")]
-        lignes = [f"Sports surveillés : {len(actifs)}\n"]
+        lignes = [f"Sports surveilles : {len(actifs)}\n"]
         for s in actifs[:20]:
             lignes.append(f"- {s.get('title', s.get('key'))}")
         if len(actifs) > 20:
             lignes.append(f"... et {len(actifs)-20} autres.")
         await update.message.reply_text("\n".join(lignes))
     except Exception as e:
-        await update.message.reply_text(f"Erreur : {e}")
+        await update.message.reply_text(f"Erreur: {e}")
 async def arbitrage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2 or len(args) > 3:
@@ -534,7 +473,7 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             seg = seg.strip()
             nom_match = re.search(r'"([^"]+)"', seg)
             if nom_match:
-                nom = nom_match.group(1)
+                nom = nom_match.group(1).strip()
                 seg = seg.replace(nom_match.group(0), "").strip()
             else:
                 nom = f"Match {len(matchs)+1}"
@@ -552,34 +491,38 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rentables = [r for r in resultats if r["rentable"]]
         gain_min = resultats[0]["gain_net"]
         gain_max = resultats[-1]["gain_net"]
-        meilleure = rentables[0] if rentables else resultats[0]
+        meilleure = rentables[0] if rentables else max(resultats, key=lambda x: x["gain_net"])
         lignes = []
         for i, r in enumerate(resultats, 1):
             signe = "+" if r["benefice_pct"] >= 0 else ""
             tag = "✅" if r["rentable"] else "❌"
+            signe_b = "+" if r["benefice_net"] >= 0 else ""
             lignes.append(
                 f"{tag} {i}. {r['noms_combo']}\n"
                 f"   Mise: {r['mise_par_combo']:,} FCFA | Cote: {r['cote_totale']}\n"
                 f"   Gain brut: {r['gain_brut']:,} FCFA | Taxe: -{r['taxe']:,} FCFA\n"
-                f"   Gain net: {r['gain_net']:,} FCFA ({signe}{r['benefice_pct']}%) | Prob: {r['prob']}%"
+                f"   Gain net: {r['gain_net']:,} FCFA | Benefice: {signe_b}{r['benefice_net']:,} FCFA ({signe}{r['benefice_pct']}%) | Prob: {r['prob']}%"
             )
         signe_m = "+" if meilleure["benefice_pct"] >= 0 else ""
         meilleure_tag = "✅ RENTABLE" if meilleure["rentable"] else "NON RENTABLE"
+        signe_bm = "+" if meilleure["benefice_net"] >= 0 else ""
         en_tete = (
             f"ALBORAA - {len(matchs)} matchs\n"
             f"Mise totale: {int(mise_totale):,} FCFA\n"
             f"Mise par combo: {mise_par_combo:,} FCFA\n"
+            f"Seuil rentabilite: +{SEUIL_BENEFICE_FCFA:,} FCFA benefice net\n"
             f"Combos rentables: {len(rentables)}/{nb_total}\n"
             f"{'='*30}\n\n"
         )
         meilleure_section = (
             f"\n{'='*30}\n"
-            f"⭐ MEILLEURE COMBO ({meilleure_tag})\n"
+            f"MEILLEURE COMBO ({meilleure_tag})\n"
             f"{meilleure['noms_combo']}\n"
             f"Prob: {meilleure['prob']}% | Mise: {meilleure['mise_par_combo']:,} FCFA\n"
             f"Gain brut: {meilleure['gain_brut']:,} FCFA\n"
             f"Taxe (10%): -{meilleure['taxe']:,} FCFA\n"
-            f"Gain net: {meilleure['gain_net']:,} FCFA ({signe_m}{meilleure['benefice_pct']}%)\n"
+            f"Gain net: {meilleure['gain_net']:,} FCFA\n"
+            f"Benefice net: {signe_bm}{meilleure['benefice_net']:,} FCFA ({signe_m}{meilleure['benefice_pct']}%)\n"
         )
         avertissement = (
             f"\n{'='*30}\n"
@@ -591,13 +534,14 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Gain net max: {gain_max:,} FCFA\n"
             f"Choisissez UNE seule combinaison."
         )
-        msg = en_tete + "\n".join(lignes) + meilleure_section + avertissement
         _save_historique(update.effective_user.id, "combo", matchs, resultats)
-        if len(msg) > 4096:
-            await update.message.reply_text(en_tete + "\n".join(lignes[:15]))
-            await update.message.reply_text("\n".join(lignes[15:]) + meilleure_section + avertissement)
-        else:
-            await update.message.reply_text(msg)
+        # Envoi par blocs de 10
+        await update.message.reply_text(en_tete)
+        for i in range(0, len(lignes), 10):
+            bloc = "\n".join(lignes[i:i+10])
+            if bloc.strip():
+                await update.message.reply_text(bloc)
+        await update.message.reply_text(meilleure_section + avertissement)
     except Exception:
         await update.message.reply_text('Erreur. Exemple: /combo "Barça vs Real" 1.30 2.21 | "Mali vs Sénégal" 1.45 3.10')
 async def simuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -776,23 +720,20 @@ def _save_historique(uid, type_op, data, result):
     else:
         resume = str(data)
     historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
+
 # ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
+
 def main():
-    # Démarrer le scanner en arrière-plan
-    scanner_thread = threading.Thread(
-        target=scanner_loop,
-        args=(TELEGRAM_TOKEN,),
-        daemon=True
-    )
+    scanner_thread = threading.Thread(target=scanner_loop, args=(TELEGRAM_TOKEN,), daemon=True)
     scanner_thread.start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("alertes_on", alertes_on))
     app.add_handler(CommandHandler("alertes_off", alertes_off))
     app.add_handler(CommandHandler("scan", scan_manuel))
-    app.add_handler(CommandHandler("sports", sports))
+    app.add_handler(CommandHandler("sports", sports_cmd))
     app.add_handler(CommandHandler("arbitrage", arbitrage))
     app.add_handler(CommandHandler("combo", combo))
     app.add_handler(CommandHandler("value", value))
@@ -806,7 +747,7 @@ def main():
     app.add_handler(CommandHandler("bilan", bilan))
     app.add_handler(CommandHandler("effacer", effacer))
     app.add_handler(CommandHandler("export", export))
-    print("Bot Alboraa demarre - version autonome")
+    print("Bot Alboraa demarre - version autonome v3")
     app.run_polling()
 if __name__ == "__main__":
     main()
