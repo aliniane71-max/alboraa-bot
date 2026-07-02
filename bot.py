@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 MISE_DEFAUT = 50000
 TAXE = 0.10
-SEUIL_BENEFICE_FCFA = 2000   # +2000 FCFA benefice net minimum pour ✅
+SEUIL_BENEFICE_FCFA = 500   # +500 FCFA benefice net minimum pour ✅
 SEUIL_ALERTE = 0.10
 INTERVALLE_SCAN = 1800
 ODDS_API_URL = "https://api.the-odds-api.com/v4"
