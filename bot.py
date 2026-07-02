@@ -17,7 +17,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
-MISE_DEFAUT = 50000
+MISE_DEFAUT = 100000
 TAXE = 0.10
 SEUIL_BENEFICE_FCFA = 500   # +500 FCFA benefice net minimum pour ✅
 SEUIL_ALERTE = 0.10
