@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Albaraa — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0f1117;
+    --card: #1a1d29;
+    --border: #2a2e3d;
+    --text: #e8e9ed;
+    --muted: #8b8f9e;
+    --green: #22c55e;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --accent: #3b82f6;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    padding: 12px;
+    max-width: 480px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+  .sous-titre { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .carte {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .carte-titre {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .bankroll-montant { font-size: 32px; font-weight: 700; }
+  .bankroll-ligne { display: flex; justify-content: space-between; margin-top: 10px; font-size: 13px; }
+  .positif { color: var(--green); }
+  .negatif { color: var(--red); }
+
+  canvas { max-height: 180px; }
+
+  .onglets { display: flex; gap: 8px; margin-bottom: 12px; }
+  .onglet {
+    flex: 1;
+    text-align: center;
+    padding: 8px;
+    border-radius: 10px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    font-size: 13px;
+    color: var(--muted);
+  }
+  .onglet.actif { background: var(--accent); color: white; border-color: var(--accent); }
+
+  .bet-carte {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--green);
+    border-radius: 10px;
+    padding: 12px;
+    margin-bottom: 8px;
+  }
+  .bet-match { font-weight: 600; font-size: 14px; }
+  .bet-issue { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+  .bet-grille {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 8px;
+    font-size: 12px;
+  }
+  .bet-label { color: var(--muted); font-size: 10px; text-transform: uppercase; }
+  .bet-valeur { font-size: 15px; font-weight: 600; }
+
+  .vide { text-align: center; color: var(--muted); padding: 24px; font-size: 13px; }
+  .chargement { text-align: center; color: var(--muted); padding: 24px; font-size: 13px; }
+
+  .badge-risque {
+    display: inline-block;
+    padding: 3px 8px;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge-ok { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge-attention { background: rgba(245,158,11,0.15); color: var(--amber); }
+  .badge-danger { background: rgba(239,68,68,0.15); color: var(--red); }
+</style>
+</head>
+<body>
+
+  <h1>Albaraa — Value Betting</h1>
+  <div class="sous-titre" id="derniere-maj">Chargement...</div>
+
+  <div class="carte">
+    <div class="carte-titre">Bankroll</div>
+    <div class="bankroll-montant" id="bankroll-montant">—</div>
+    <div class="bankroll-ligne">
+      <span>Exposition actuelle : <span id="exposition">—</span></span>
+      <span id="badge-risque-global"></span>
+    </div>
+    <canvas id="graphique-bankroll"></canvas>
+  </div>
+
+  <div class="onglets">
+    <div class="onglet actif" data-vue="actifs">Value bets actifs</div>
+    <div class="onglet" data-vue="historique">Historique</div>
+  </div>
+
+  <div id="vue-actifs">
+    <div class="carte">
+      <div class="carte-titre">Opportunités détectées</div>
+      <div id="liste-bets"><div class="chargement">Chargement...</div></div>
+    </div>
+  </div>
+
+  <div id="vue-historique" style="display:none">
+    <div class="carte">
+      <div class="carte-titre">Paris réglés</div>
+      <div id="liste-historique"><div class="chargement">Chargement...</div></div>
+    </div>
+  </div>
+
+<script>
+// ============================================================
+// CONFIGURATION — à adapter à ton API FastAPI/Flask sur Railway
+// ============================================================
+const API_BASE = "https://ton-service.up.railway.app"; // remplace par ton URL réelle
+const ENDPOINTS = {
+  bankroll: `${API_BASE}/api/bankroll`,
+  bets_actifs: `${API_BASE}/api/value-bets/actifs`,
+  historique: `${API_BASE}/api/value-bets/historique`,
+};
+
+// Données de démonstration utilisées si l'API n'est pas encore branchée.
+const DONNEES_DEMO = {
+  bankroll: {
+    montant: 187500,
+    historique_7j: [175000, 178200, 182000, 179500, 184000, 186000, 187500],
+    exposition_pct: 12.4,
+  },
+  bets_actifs: [
+    {
+      match: "Argentine vs Égypte",
+      issue: "Victoire Argentine",
+      prob_modele: 0.68,
+      cote: 1.63,
+      edge_pct: 8.2,
+      mise_recommandee: 4200,
+      book: "1xBet",
+    },
+    {
+      match: "France vs Maroc",
+      issue: "Nul",
+      prob_modele: 0.29,
+      cote: 3.90,
+      edge_pct: 5.1,
+      mise_recommandee: 2100,
+      book: "223Bet",
+    },
+  ],
+  historique: [
+    { match: "Suisse vs Colombie", issue: "Victoire Suisse", resultat: "gagné", profit: 3150 },
+    { match: "Norvège vs Angleterre", issue: "Victoire Angleterre", resultat: "perdu", profit: -1900 },
+  ],
+};
+
+let modeDemo = false;
+
+async function chargerJSON(url) {
+  const rep = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (!rep.ok) throw new Error(`Erreur API : ${rep.status}`);
+  return rep.json();
+}
+
+function formatFCFA(n) {
+  return new Intl.NumberFormat("fr-FR").format(Math.round(n)) + " FCFA";
+}
+
+function badgeExposition(pct) {
+  if (pct < 15) return '<span class="badge-risque badge-ok">Sain</span>';
+  if (pct < 25) return '<span class="badge-risque badge-attention">Attention</span>';
+  return '<span class="badge-risque badge-danger">Élevé</span>';
+}
+
+function rendreBankroll(data) {
+  document.getElementById("bankroll-montant").textContent = formatFCFA(data.montant);
+  document.getElementById("exposition").textContent = data.exposition_pct.toFixed(1) + "%";
+  document.getElementById("badge-risque-global").innerHTML = badgeExposition(data.exposition_pct);
+
+  new Chart(document.getElementById("graphique-bankroll"), {
+    type: "line",
+    data: {
+      labels: data.historique_7j.map((_, i) => `J-${data.historique_7j.length - i - 1}`),
+      datasets: [{
+        data: data.historique_7j,
+        borderColor: "#3b82f6",
+        backgroundColor: "rgba(59,130,246,0.1)",
+        fill: true,
+        tension: 0.3,
+        pointRadius: 0,
+      }],
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { ticks: { color: "#8b8f9e", font: { size: 10 } }, grid: { display: false } },
+        y: { ticks: { color: "#8b8f9e", font: { size: 10 } }, grid: { color: "#2a2e3d" } },
+      },
+    },
+  });
+}
+
+function rendreBetsActifs(bets) {
+  const conteneur = document.getElementById("liste-bets");
+  if (!bets.length) {
+    conteneur.innerHTML = '<div class="vide">Aucune opportunité détectée actuellement.</div>';
+    return;
+  }
+  conteneur.innerHTML = bets.map(b => `
+    <div class="bet-carte">
+      <div class="bet-match">${b.match}</div>
+      <div class="bet-issue">${b.issue} · ${b.book}</div>
+      <div class="bet-grille">
+        <div><div class="bet-label">Edge</div><div class="bet-valeur positif">+${b.edge_pct.toFixed(1)}%</div></div>
+        <div><div class="bet-label">Cote</div><div class="bet-valeur">${b.cote.toFixed(2)}</div></div>
+        <div><div class="bet-label">Mise conseillée</div><div class="bet-valeur">${formatFCFA(b.mise_recommandee)}</div></div>
+      </div>
+    </div>
+  `).join("");
+}
+
+function rendreHistorique(paris) {
+  const conteneur = document.getElementById("liste-historique");
+  if (!paris.length) {
+    conteneur.innerHTML = '<div class="vide">Aucun pari réglé pour le moment.</div>';
+    return;
+  }
+  conteneur.innerHTML = paris.map(p => `
+    <div class="bet-carte" style="border-left-color: ${p.resultat === 'gagné' ? 'var(--green)' : 'var(--red)'}">
+      <div class="bet-match">${p.match}</div>
+      <div class="bet-issue">${p.issue}</div>
+      <div class="bet-valeur ${p.profit >= 0 ? 'positif' : 'negatif'}">
+        ${p.profit >= 0 ? '+' : ''}${formatFCFA(p.profit)}
+      </div>
+    </div>
+  `).join("");
+}
+
+async function initialiser() {
+  try {
+    const [bankroll, bets, historique] = await Promise.all([
+      chargerJSON(ENDPOINTS.bankroll),
+      chargerJSON(ENDPOINTS.bets_actifs),
+      chargerJSON(ENDPOINTS.historique),
+    ]);
+    rendreBankroll(bankroll);
+    rendreBetsActifs(bets);
+    rendreHistorique(historique);
+    document.getElementById("derniere-maj").textContent =
+      "Mis à jour : " + new Date().toLocaleTimeString("fr-FR");
+  } catch (e) {
+    modeDemo = true;
+    rendreBankroll(DONNEES_DEMO.bankroll);
+    rendreBetsActifs(DONNEES_DEMO.bets_actifs);
+    rendreHistorique(DONNEES_DEMO.historique);
+    document.getElementById("derniere-maj").textContent =
+      "Mode démo — API non connectée (" + e.message + ")";
+  }
+}
+
+document.querySelectorAll(".onglet").forEach(onglet => {
+  onglet.addEventListener("click", () => {
+    document.querySelectorAll(".onglet").forEach(o => o.classList.remove("actif"));
+    onglet.classList.add("actif");
+    const vue = onglet.dataset.vue;
+    document.getElementById("vue-actifs").style.display = vue === "actifs" ? "block" : "none";
+    document.getElementById("vue-historique").style.display = vue === "historique" ? "block" : "none";
+  });
+});
+
+initialiser();
+setInterval(initialiser, 60000); // rafraîchissement auto toutes les 60s
+</script>
+</body>
+</html>
