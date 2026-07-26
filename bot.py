@@ -29,6 +29,18 @@ objectif_data = {}
 abonnes_alertes = set()
 alertes_envoyees = set()
 # ─────────────────────────────────────────────
+# BOOKMAKERS EXCLUS (suspendus, en litige fiscal, etc.)
+# Liste par defaut modifiable via la variable Railway BOOKMAKERS_EXCLUS
+# (noms separes par des virgules). Modifiable a chaud via /exclure et /inclure,
+# mais reinitialisee a la valeur par defaut/env a chaque redemarrage du bot.
+# ─────────────────────────────────────────────
+BOOKMAKERS_EXCLUS_DEFAUT = "1xBet,Premier Bet,Bet223"
+bookmakers_exclus = set(
+    b.strip().lower()
+    for b in os.getenv("BOOKMAKERS_EXCLUS", BOOKMAKERS_EXCLUS_DEFAUT).split(",")
+    if b.strip()
+)
+# ─────────────────────────────────────────────
 # MOTEUR DE CALCUL
 # ─────────────────────────────────────────────
 class AlboraEngine:
@@ -172,6 +184,8 @@ class OddsEngine:
             best = {"home": 0, "draw": 0, "away": 0, "bk_home": "", "bk_draw": "", "bk_away": ""}
             for bk in bookmakers:
                 bk_name = bk.get("title", "?")
+                if bk_name.strip().lower() in bookmakers_exclus:
+                    continue
                 for market in bk.get("markets", []):
                     if market.get("key") != "h2h":
                         continue
@@ -298,7 +312,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/alertes_on — Activer les alertes\n"
         "/alertes_off — Desactiver les alertes\n"
         "/scan — Scan manuel immediat\n"
-        "/sports — Sports surveilles\n\n"
+        "/sports — Sports surveilles\n"
+        "/exclure NomBookmaker — Exclure un bookmaker des scans\n"
+        "/inclure NomBookmaker — Reactiver un bookmaker\n"
+        "/liste_exclus — Voir les bookmakers exclus\n\n"
         "GESTION\n"
         "/bankroll 500000\n"
         "/bankroll_pari 5000 15000\n"
@@ -364,6 +381,35 @@ async def scan_manuel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text(_formater_alerte(alerte))
     except Exception as e:
         await update.message.reply_text(f"Erreur scan: {str(e)[:200]}")
+async def exclure_bookmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Format: /exclure NomBookmaker\nExemple: /exclure Melbet"
+        )
+        return
+    nom = " ".join(context.args).strip().lower()
+    bookmakers_exclus.add(nom)
+    liste = ", ".join(sorted(bookmakers_exclus)) or "aucune"
+    await update.message.reply_text(
+        f"'{nom}' exclu des scans.\nListe actuelle: {liste}\n\n"
+        f"Note: reinitialisee a la liste par defaut si le bot redemarre."
+    )
+async def inclure_bookmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Format: /inclure NomBookmaker\nExemple: /inclure 1xBet"
+        )
+        return
+    nom = " ".join(context.args).strip().lower()
+    bookmakers_exclus.discard(nom)
+    liste = ", ".join(sorted(bookmakers_exclus)) or "aucune"
+    await update.message.reply_text(f"'{nom}' reactive.\nListe actuelle: {liste}")
+async def liste_exclus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not bookmakers_exclus:
+        await update.message.reply_text("Aucun bookmaker exclu actuellement.")
+        return
+    lignes = ["BOOKMAKERS EXCLUS DES SCANS"] + [f"- {b}" for b in sorted(bookmakers_exclus)]
+    await update.message.reply_text("\n".join(lignes))
 async def sports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ODDS_API_KEY:
         await update.message.reply_text("ODDS_API_KEY manquante. Cle gratuite sur : the-odds-api.com")
@@ -728,6 +774,9 @@ def main():
     app.add_handler(CommandHandler("alertes_off", alertes_off))
     app.add_handler(CommandHandler("scan", scan_manuel))
     app.add_handler(CommandHandler("sports", sports_cmd))
+    app.add_handler(CommandHandler("exclure", exclure_bookmaker))
+    app.add_handler(CommandHandler("inclure", inclure_bookmaker))
+    app.add_handler(CommandHandler("liste_exclus", liste_exclus))
     app.add_handler(CommandHandler("arbitrage", arbitrage))
     app.add_handler(CommandHandler("combo", combo))
     app.add_handler(CommandHandler("value", value))
