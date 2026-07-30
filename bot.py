@@ -13,6 +13,18 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from datetime import datetime
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ODDS_API_KEY = os.getenv("ODDS_API_KEY")
+ALLOWED_USER_IDS = set(
+    int(x.strip()) for x in os.getenv("ALLOWED_USER_IDS", "").split(",") if x.strip().isdigit()
+)
+
+
+def est_autorise(uid: int) -> bool:
+    """Si ALLOWED_USER_IDS est vide (variable non definie), aucune restriction n'est appliquee
+    (comportement identique a avant ce patch). Definir ALLOWED_USER_IDS sur Railway
+    (IDs Telegram separes par des virgules) pour restreindre les commandes sensibles."""
+    return not ALLOWED_USER_IDS or uid in ALLOWED_USER_IDS
+
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
@@ -28,21 +40,12 @@ bankroll_data = {}
 objectif_data = {}
 abonnes_alertes = set()
 alertes_envoyees = set()
-# ─────────────────────────────────────────────
-# BOOKMAKERS EXCLUS (suspendus, en litige fiscal, etc.)
-# Liste par defaut modifiable via la variable Railway BOOKMAKERS_EXCLUS
-# (noms separes par des virgules). Modifiable a chaud via /exclure et /inclure,
-# mais reinitialisee a la valeur par defaut/env a chaque redemarrage du bot.
-# ─────────────────────────────────────────────
 BOOKMAKERS_EXCLUS_DEFAUT = "1xBet,Premier Bet,Bet223"
 bookmakers_exclus = set(
     b.strip().lower()
     for b in os.getenv("BOOKMAKERS_EXCLUS", BOOKMAKERS_EXCLUS_DEFAUT).split(",")
     if b.strip()
 )
-# ─────────────────────────────────────────────
-# MOTEUR DE CALCUL
-# ─────────────────────────────────────────────
 class AlboraEngine:
     @staticmethod
     def detect_arbitrage(cotes):
@@ -141,9 +144,6 @@ class AlboraEngine:
             "emoji": emoji,
             "nb_matchs": len(cotes_combo),
         }
-# ─────────────────────────────────────────────
-# ODDS API
-# ─────────────────────────────────────────────
 class OddsEngine:
     @staticmethod
     def get_sports():
@@ -224,9 +224,6 @@ class OddsEngine:
                 "benefice_pct": benefice_pct,
             })
         return opportunites
-# ─────────────────────────────────────────────
-# SCANNER AUTOMATIQUE
-# ─────────────────────────────────────────────
 def scanner_loop(bot_token: str):
     bot = Bot(token=bot_token)
     logging.info("Scanner automatique demarre.")
@@ -295,13 +292,9 @@ def _formater_alerte(alerte):
             f"Benefice net: +{int(opp['benefice_net']):,} FCFA\n\n"
             f"Misez maintenant sur 1xBet."
         )
-# ─────────────────────────────────────────────
-# COMMANDES TELEGRAM
-# ─────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
         "ALBORAA BOT - Arbitrage et Combinaisons\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         "ANALYSE MANUELLE\n"
         '/combo "Barça vs Real" 1.30 2.21 3.12 | "Mali vs Sénégal" 1.45 3.10\n'
         "/arbitrage 1.21 3.02 3.10\n"
@@ -324,7 +317,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/objectif_bilan\n\n"
         "HISTORIQUE\n"
         "/bilan | /effacer | /export\n\n"
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"Devise: Franc CFA\n"
         f"Mise defaut: {MISE_DEFAUT:,} FCFA\n"
         f"Taxe Mali: {int(TAXE*100)}%\n"
@@ -577,7 +569,6 @@ async def combo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Choisissez UNE seule combinaison."
         )
         _save_historique(update.effective_user.id, "combo", matchs, resultats)
-        # Envoi par blocs de 10
         await update.message.reply_text(en_tete)
         for i in range(0, len(lignes), 10):
             bloc = "\n".join(lignes[i:i+10])
@@ -610,6 +601,9 @@ async def simuler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Erreur. Exemple: /simuler 1.85 10000")
 async def bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if not context.args:
         await update.message.reply_text("Format: /bankroll 500000")
         return
@@ -626,6 +620,9 @@ async def bankroll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Exemple: /bankroll 500000")
 async def bankroll_pari(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if uid not in bankroll_data:
         await update.message.reply_text("Initialisez d'abord: /bankroll 500000")
         return
@@ -651,6 +648,9 @@ async def bankroll_pari(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Erreur. Exemple: /bankroll_pari 5000 15000")
 async def bankroll_bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if uid not in bankroll_data:
         await update.message.reply_text("Aucune bankroll. Commencez: /bankroll 500000")
         return
@@ -669,6 +669,9 @@ async def bankroll_bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 async def objectif(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if not context.args:
         await update.message.reply_text("Format: /objectif 1000000")
         return
@@ -688,6 +691,9 @@ async def objectif(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Exemple: /objectif 1000000")
 async def objectif_bilan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if uid not in objectif_data:
         await update.message.reply_text("Aucun objectif. Fixez-en un: /objectif 1000000")
         return
@@ -721,6 +727,9 @@ async def effacer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Historique efface.")
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    if not est_autorise(uid):
+        await update.message.reply_text("Acces non autorise.")
+        return
     if uid not in historique or not historique[uid]:
         await update.message.reply_text("Aucune donnee a exporter.")
         return
@@ -762,9 +771,6 @@ def _save_historique(uid, type_op, data, result):
     else:
         resume = str(data)
     historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
-# ─────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────
 def main():
     scanner_thread = threading.Thread(target=scanner_loop, args=(TELEGRAM_TOKEN,), daemon=True)
     scanner_thread.start()
