@@ -1,5 +1,9 @@
+import asyncio
+import atexit
+import json
 import logging
 import os
+import sqlite3
 import re
 import threading
 import time
@@ -29,6 +33,10 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
+# httpx logue l'URL complete de chaque requete Telegram, qui contient le token.
+# On remonte son niveau pour que le token n'apparaisse jamais dans les logs Railway.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 MISE_DEFAUT = 100000
 TAXE = 0.10
 SEUIL_BENEFICE_FCFA = 500   # +500 FCFA benefice net minimum pour ✅
@@ -39,13 +47,91 @@ historique = {}
 bankroll_data = {}
 objectif_data = {}
 abonnes_alertes = set()
-alertes_envoyees = set()
+alertes_envoyees = {}  # id d'alerte -> timestamp d'envoi (purge apres 24h)
+DUREE_VIE_ALERTE = 24 * 3600
 BOOKMAKERS_EXCLUS_DEFAUT = "1xBet,Premier Bet,Bet223"
 bookmakers_exclus = set(
     b.strip().lower()
     for b in os.getenv("BOOKMAKERS_EXCLUS", BOOKMAKERS_EXCLUS_DEFAUT).split(",")
     if b.strip()
 )
+
+# ─────────────────────────────────────────────
+# PERSISTANCE (SQLite)
+# ─────────────────────────────────────────────
+# ATTENTION : sur Railway, le disque est efface a chaque redeploiement SAUF si un
+# volume est attache au service (Settings > Volumes, monte par ex. sur /data).
+# Sans volume, le bot marche mais ne garde rien entre deux deploiements.
+DB_PATH = os.getenv("DB_PATH") or ("/data/alboraa.db" if os.path.isdir("/data") else "alboraa.db")
+_db_lock = threading.Lock()
+
+
+def _db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("CREATE TABLE IF NOT EXISTS etat (cle TEXT PRIMARY KEY, valeur TEXT NOT NULL)")
+    return conn
+
+
+def sauvegarder_etat():
+    """Ecrit l'etat complet (bankroll, objectifs, abonnes, historique, exclusions, alertes)."""
+    try:
+        with _db_lock:
+            etat = {
+                "historique": {str(k): v for k, v in historique.items()},
+                "bankroll_data": {str(k): v for k, v in bankroll_data.items()},
+                "objectif_data": {str(k): v for k, v in objectif_data.items()},
+                "abonnes_alertes": list(abonnes_alertes),
+                "bookmakers_exclus": sorted(bookmakers_exclus),
+                "alertes_envoyees": dict(alertes_envoyees),
+            }
+            conn = _db_connect()
+            with conn:
+                for cle, val in etat.items():
+                    conn.execute(
+                        "INSERT OR REPLACE INTO etat (cle, valeur) VALUES (?, ?)",
+                        (cle, json.dumps(val)),
+                    )
+            conn.close()
+    except Exception as e:
+        logging.error(f"Sauvegarde etat: {e}")
+
+
+def charger_etat():
+    """Recharge l'etat au demarrage. Si la base n'existe pas ou est vide, on repart a zero."""
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            lignes = dict(conn.execute("SELECT cle, valeur FROM etat").fetchall())
+            conn.close()
+        if not lignes:
+            return
+        def lire(cle, defaut):
+            return json.loads(lignes[cle]) if cle in lignes else defaut
+        historique.update({int(k): v for k, v in lire("historique", {}).items()})
+        bankroll_data.update({int(k): v for k, v in lire("bankroll_data", {}).items()})
+        objectif_data.update({int(k): v for k, v in lire("objectif_data", {}).items()})
+        abonnes_alertes.update(int(x) for x in lire("abonnes_alertes", []))
+        if "bookmakers_exclus" in lignes:
+            bookmakers_exclus.clear()
+            bookmakers_exclus.update(lire("bookmakers_exclus", []))
+        alertes_envoyees.update(lire("alertes_envoyees", {}))
+        logging.info(f"Etat recharge depuis {DB_PATH}.")
+    except Exception as e:
+        logging.error(f"Chargement etat: {e}")
+
+
+def _sauvegarde_periodique():
+    while True:
+        time.sleep(60)
+        sauvegarder_etat()
+
+
+def _purger_alertes():
+    limite = time.time() - DUREE_VIE_ALERTE
+    for k in [k for k, t in alertes_envoyees.items() if t < limite]:
+        alertes_envoyees.pop(k, None)
+
+
 class AlboraEngine:
     @staticmethod
     def detect_arbitrage(cotes):
@@ -226,9 +312,12 @@ class OddsEngine:
         return opportunites
 def scanner_loop(bot_token: str):
     bot = Bot(token=bot_token)
+    loop = asyncio.new_event_loop()  # une seule boucle reutilisee pour tous les envois
+    asyncio.set_event_loop(loop)
     logging.info("Scanner automatique demarre.")
     while True:
         try:
+            _purger_alertes()
             if abonnes_alertes and ODDS_API_KEY:
                 logging.info("Scan en cours...")
                 sports = OddsEngine.get_sports()
@@ -242,20 +331,20 @@ def scanner_loop(bot_token: str):
                     for opp in OddsEngine.analyser_matchs(events):
                         match_id = f"{opp['match']}_{opp['heure']}"
                         if opp["arbitrage"]["arbitrage"] and match_id + "_arb" not in alertes_envoyees:
-                            alertes_envoyees.add(match_id + "_arb")
+                            alertes_envoyees[match_id + "_arb"] = time.time()
                             alertes_session.append({"type": "ARBITRAGE", "sport": sport.get("title", ""), "opp": opp})
                         elif opp["benefice_net"] >= SEUIL_BENEFICE_FCFA and match_id + "_val" not in alertes_envoyees:
-                            alertes_envoyees.add(match_id + "_val")
+                            alertes_envoyees[match_id + "_val"] = time.time()
                             alertes_session.append({"type": "VALUE", "sport": sport.get("title", ""), "opp": opp})
                     time.sleep(0.5)
                 for alerte in alertes_session:
                     msg = _formater_alerte(alerte)
                     for uid in list(abonnes_alertes):
                         try:
-                            import asyncio
-                            asyncio.run(bot.send_message(chat_id=uid, text=msg))
+                            loop.run_until_complete(bot.send_message(chat_id=uid, text=msg))
                         except Exception as e:
                             logging.error(f"Envoi alerte: {e}")
+                sauvegarder_etat()
                 logging.info(f"Scan termine. {len(alertes_session)} alerte(s).")
         except Exception as e:
             logging.error(f"Scanner error: {e}")
@@ -263,6 +352,12 @@ def scanner_loop(bot_token: str):
 def _formater_alerte(alerte):
     opp = alerte["opp"]
     best = opp["best"]
+    bookmakers = []
+    for k in ("bk_home", "bk_draw", "bk_away"):
+        nom = best.get(k)
+        if nom and nom not in bookmakers:
+            bookmakers.append(nom)
+    cta = f"Misez maintenant chez : {', '.join(bookmakers)}." if bookmakers else "Verifiez les cotes avant de miser."
     sport = alerte["sport"]
     if alerte["type"] == "ARBITRAGE":
         arb = opp["arbitrage"]
@@ -274,7 +369,7 @@ def _formater_alerte(alerte):
             f"1 ({best['bk_home']}): {best['home']}\n"
             f"N ({best['bk_draw']}): {best['draw']}\n"
             f"2 ({best['bk_away']}): {best['away']}\n\n"
-            f"Misez maintenant sur 1xBet."
+            f"{cta}"
         )
     else:
         signe = "+" if opp["benefice_pct"] >= 0 else ""
@@ -290,7 +385,7 @@ def _formater_alerte(alerte):
             f"Taxe (10%): -{int(opp['gain_net'] / 0.9 * 0.1):,} FCFA\n"
             f"Gain net: {int(opp['gain_net']):,} FCFA ({signe}{opp['benefice_pct']}%)\n"
             f"Benefice net: +{int(opp['benefice_net']):,} FCFA\n\n"
-            f"Misez maintenant sur 1xBet."
+            f"{cta}"
         )
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
@@ -383,8 +478,7 @@ async def exclure_bookmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bookmakers_exclus.add(nom)
     liste = ", ".join(sorted(bookmakers_exclus)) or "aucune"
     await update.message.reply_text(
-        f"'{nom}' exclu des scans.\nListe actuelle: {liste}\n\n"
-        f"Note: reinitialisee a la liste par defaut si le bot redemarre."
+        f"'{nom}' exclu des scans.\nListe actuelle: {liste}"
     )
 async def inclure_bookmaker(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -772,6 +866,9 @@ def _save_historique(uid, type_op, data, result):
         resume = str(data)
     historique[uid].append({"type": type_op, "resume": resume, "heure": heure})
 def main():
+    charger_etat()
+    atexit.register(sauvegarder_etat)
+    threading.Thread(target=_sauvegarde_periodique, daemon=True).start()
     scanner_thread = threading.Thread(target=scanner_loop, args=(TELEGRAM_TOKEN,), daemon=True)
     scanner_thread.start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -796,7 +893,7 @@ def main():
     app.add_handler(CommandHandler("bilan", bilan))
     app.add_handler(CommandHandler("effacer", effacer))
     app.add_handler(CommandHandler("export", export))
-    print("Bot Alboraa demarre - version autonome v3")
+    print("Bot Alboraa demarre - version autonome v4 (persistance + logs securises)")
     app.run_polling()
 if __name__ == "__main__":
     main()
